@@ -5,6 +5,8 @@ from collections import defaultdict
 from utils import calculateHomography, transformPoints
 from database import Database
 from floorReplica import floorReplica
+from config import Config
+from scipy.stats import linregress
 import time as time_module
  
 class CameraProcessor:
@@ -26,6 +28,10 @@ class CameraProcessor:
         self.lastRecorded = 0
         self.currentFrameId = 0
         self.livePeopleCount = 0  # Initialize live people count
+        self.rtspUrl = Config.CAMERA_URL
+        self.cap = cv2.VideoCapture(self.rtspUrl)
+        self.rolling_counts = []
+        self.max_rolling_window = 10
  
     # Function to calculate the homography matrix
     def calculateHomography(self):
@@ -35,20 +41,26 @@ class CameraProcessor:
  
     def processFrame(self, frame):
         try:
+            # Perform object detection using YOLO  
             results = self.model.track(frame, persist=True, show=False, imgsz=1280, verbose=False)
             annotatedFrame = frame.copy()
             floorAnnotatedFrame = self.floorImage.copy()
             totalPeople = 0
+            positions = []
  
             if results[0].boxes is not None and hasattr(results[0].boxes, 'id'):
+                # Extract bounding boxes, track IDs, and classes from detection results
                 boxes = results[0].boxes.xywh.cpu().numpy()
                 trackIDs = results[0].boxes.id.int().cpu().numpy()
                 classes = results[0].boxes.cls.cpu().numpy()
                 
+                # Filter for human detections
                 human_indices = classes == 0
                 human_boxes = boxes[human_indices]
                 human_trackIDs = trackIDs[human_indices]
                 
+                # Process each detected person
+                # Draw movement history on floor annotation
                 for trackID in np.unique(human_trackIDs):
                     history = self.trackHistory[trackID]
                     if len(history) > 1:
@@ -64,6 +76,11 @@ class CameraProcessor:
                     
                     if len(self.trackHistory[trackID]) > 50:
                         self.trackHistory[trackID].pop(0)
+
+                    # Calculate normalized positions for heatmap
+                    norm_x = x / frame.shape[1]
+                    norm_y = y / frame.shape[0]
+                    positions.append((norm_x, norm_y)) 
                     
                     cv2.rectangle(annotatedFrame, (int(x - w/2), int(y - h/2)), (int(x + w/2), int(y + h/2)), (0, 255, 0), 2)
                     cv2.putText(annotatedFrame, f"ID: {int(trackID)}", (int(x - w/2), int(y - h/2) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
@@ -78,9 +95,25 @@ class CameraProcessor:
     
         self.currentFrameId += 1
         self.livePeopleCount = totalPeople  # Update live people count
-        self.db.insertRecord(totalPeople, self.currentFrameId)
+        self.updateRollingAverage(totalPeople)
+        self.predictFutureCrowd()
+        self.db.insertRecord(totalPeople, self.currentFrameId, positions)
         
         return annotatedFrame, floorAnnotatedFrame
+    
+    def updateRollingAverage(self, count):
+        self.rolling_counts.append(count)
+        if len(self.rolling_counts) > self.max_rolling_window:
+            self.rolling_counts.pop(0)
+        self.rolling_average = sum(self.rolling_counts) / len(self.rolling_counts)
+
+    # Predict future crowd size using linear regression
+    def predictFutureCrowd(self):
+        if len(self.rolling_counts) >= 5:  # Minimum data points for prediction
+            x = np.arange(len(self.rolling_counts))
+            y = np.array(self.rolling_counts)
+            slope, intercept, _, _, _ = linregress(x, y)
+            self.future_prediction = slope * (len(self.rolling_counts) + 5) + intercept  # Predict 5 time units ahead
  
     def run(self):
         while True:
